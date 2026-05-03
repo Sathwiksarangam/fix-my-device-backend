@@ -1,5 +1,7 @@
 using System.Text.Json;
+
 DeviceSystemInfoRequest? latestDevice = null;
+
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddEndpointsApiExplorer();
@@ -40,18 +42,24 @@ app.MapGet("/api/devices", () =>
         {
             id = "device-real-001",
             deviceName = latestDevice.DeviceName,
+            processor = latestDevice.ProcessorName,
+            processorSpeed = latestDevice.ProcessorSpeed,
+            installedRam = latestDevice.InstalledRam,
+            usableRam = latestDevice.UsableRam,
+            graphicsCard = latestDevice.GraphicsCard,
+            graphicsMemory = latestDevice.GraphicsMemory,
+            totalStorage = latestDevice.TotalStorage,
+            usedStorage = latestDevice.UsedStorage,
+            freeStorage = latestDevice.FreeStorage,
+            deviceId = latestDevice.DeviceId,
+            productId = latestDevice.ProductId,
             systemType = latestDevice.SystemType,
+            windowsEdition = latestDevice.WindowsEdition,
+            windowsVersion = latestDevice.WindowsVersion,
+            osBuild = latestDevice.OsBuild,
+            installedOn = latestDevice.InstalledOn,
             status = "Online",
             lastSeenAt = "Just now",
-            processor = request.ProcessorName,
-            processorSpeed = request.ProcessorSpeed,
-            installedRam = request.InstalledRam,
-            usableRam = request.UsableRam,
-            graphicsCard = request.GraphicsCard,
-            graphicsMemory = request.GraphicsMemory,
-            totalStorage = request.TotalStorage,
-            usedStorage = request.UsedStorage,
-            windowsVersion = latestDevice.WindowsVersion,
             drives = latestDevice.Drives
         }
     });
@@ -73,19 +81,24 @@ app.MapPost("/api/devices/system-info", (DeviceSystemInfoRequest request) =>
         receivedAt = DateTime.Now.ToString("g"),
         device = new
         {
+            id = "device-real-001",
+            deviceName = request.DeviceName,
+            processor = request.ProcessorName,
+            processorSpeed = request.ProcessorSpeed,
+            installedRam = request.InstalledRam,
+            usableRam = request.UsableRam,
+            graphicsCard = request.GraphicsCard,
+            graphicsMemory = request.GraphicsMemory,
+            totalStorage = request.TotalStorage,
+            usedStorage = request.UsedStorage,
+            freeStorage = request.FreeStorage,
             deviceId = request.DeviceId,
             productId = request.ProductId,
+            systemType = request.SystemType,
             windowsEdition = request.WindowsEdition,
+            windowsVersion = request.WindowsVersion,
             osBuild = request.OsBuild,
             installedOn = request.InstalledOn,
-            deviceName = request.DeviceName,
-            processor = request.Processor,
-            installedRam = request.Ram,
-            graphicsCard = request.Graphics,
-            totalStorage = request.Storage,
-            freeStorage = request.FreeStorage,
-            systemType = request.SystemType,
-            windowsVersion = request.WindowsVersion,
             status = "Online",
             lastSeenAt = "Just now",
             drives = request.Drives
