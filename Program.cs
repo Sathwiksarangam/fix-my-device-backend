@@ -43,11 +43,14 @@ app.MapGet("/api/devices", () =>
             systemType = latestDevice.SystemType,
             status = "Online",
             lastSeenAt = "Just now",
-            processor = latestDevice.Processor,
-            installedRam = latestDevice.Ram,
-            graphicsCard = latestDevice.Graphics,
-            totalStorage = latestDevice.Storage,
-            freeStorage = latestDevice.FreeStorage,
+            processor = request.ProcessorName,
+            processorSpeed = request.ProcessorSpeed,
+            installedRam = request.InstalledRam,
+            usableRam = request.UsableRam,
+            graphicsCard = request.GraphicsCard,
+            graphicsMemory = request.GraphicsMemory,
+            totalStorage = request.TotalStorage,
+            usedStorage = request.UsedStorage,
             windowsVersion = latestDevice.WindowsVersion,
             drives = latestDevice.Drives
         }
@@ -70,7 +73,11 @@ app.MapPost("/api/devices/system-info", (DeviceSystemInfoRequest request) =>
         receivedAt = DateTime.Now.ToString("g"),
         device = new
         {
-            id = "device-real-001",
+            deviceId = request.DeviceId,
+            productId = request.ProductId,
+            windowsEdition = request.WindowsEdition,
+            osBuild = request.OsBuild,
+            installedOn = request.InstalledOn,
             deviceName = request.DeviceName,
             processor = request.Processor,
             installedRam = request.Ram,
@@ -89,20 +96,32 @@ app.MapPost("/api/devices/system-info", (DeviceSystemInfoRequest request) =>
 app.Run();
 
 record DeviceSystemInfoRequest(
-    string DeviceName,
-    string Processor,
-    string Ram,
-    string Graphics,
-    string Storage,
-    string FreeStorage,
-    string SystemType,
-    string WindowsVersion,
-    List<DriveInfoRequest> Drives
+    string? DeviceName,
+    string? ProcessorName,
+    string? ProcessorSpeed,
+    string? InstalledRam,
+    string? UsableRam,
+    string? GraphicsCard,
+    string? GraphicsMemory,
+    string? TotalStorage,
+    string? UsedStorage,
+    string? FreeStorage,
+    string? DeviceId,
+    string? ProductId,
+    string? SystemType,
+    string? WindowsEdition,
+    string? WindowsVersion,
+    string? OsBuild,
+    string? InstalledOn,
+    List<DriveInfoRequest>? Drives
 );
 
 record DriveInfoRequest(
-    string DriveLetter,
-    string DriveType,
-    string TotalSize,
-    string FreeSpace
+    string? DriveLetter,
+    string? DriveType,
+    string? FileSystem,
+    string? VolumeLabel,
+    string? TotalSize,
+    string? UsedSpace,
+    string? FreeSpace
 );
