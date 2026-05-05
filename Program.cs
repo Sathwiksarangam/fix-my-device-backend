@@ -1,8 +1,4 @@
 using System.Text.Json;
-using fix_my_device_backend.Data;
-using fix_my_device_backend.Models;
-using Microsoft.EntityFrameworkCore;
-using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -19,15 +15,14 @@ builder.Services.AddCors(options =>
     });
 });
 
-var rawConnectionString = builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection is missing.");
-
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseNpgsql(BuildConnectionString(rawConnectionString)));
-
 var app = builder.Build();
-var tokensByValue = new Dictionary<string, Guid>(StringComparer.Ordinal);
 
+var usersFilePath = Path.Combine(app.Environment.ContentRootPath, "users.json");
+var tokensByValue = new Dictionary<string, string>(StringComparer.Ordinal);
+var devicesByUserId = new Dictionary<string, List<DeviceRecord>>(StringComparer.Ordinal);
+var stateLock = new object();
+
+EnsureUsersFileExists(usersFilePath);
 
 if (app.Environment.IsDevelopment())
 {
@@ -39,7 +34,7 @@ app.UseCors("AllowFlutterApp");
 
 app.MapGet("/", () => "Fix My Device API is running");
 
-app.MapPost("/api/auth/register", async (RegisterRequest request, AppDbContext dbContext) =>
+app.MapPost("/api/auth/register", (RegisterRequest request) =>
 {
     if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
     {
@@ -48,29 +43,28 @@ app.MapPost("/api/auth/register", async (RegisterRequest request, AppDbContext d
 
     var normalizedEmail = request.Email.Trim().ToLowerInvariant();
 
-    var existingUser = await dbContext.Users
-        .FirstOrDefaultAsync(user => user.Email == normalizedEmail);
-
-    if (existingUser is not null)
+    lock (stateLock)
     {
-        return Results.Conflict(new { message = "User already exists." });
+        var users = LoadUsers(usersFilePath);
+
+        if (users.Any(user => user.Email.Equals(normalizedEmail, StringComparison.OrdinalIgnoreCase)))
+        {
+            return Results.Conflict(new { message = "User already exists." });
+        }
+
+        users.Add(new StoredUser(
+            Guid.NewGuid().ToString("N"),
+            normalizedEmail,
+            request.Password.Trim(),
+            DateTime.UtcNow));
+
+        SaveUsers(usersFilePath, users);
     }
-
-    var user = new User
-    {
-        Id = Guid.NewGuid(),
-        Email = normalizedEmail,
-        PasswordHash = request.Password.Trim(),
-        CreatedAt = DateTime.UtcNow,
-    };
-
-    dbContext.Users.Add(user);
-    await dbContext.SaveChangesAsync();
 
     return Results.Ok(new { message = "User registered successfully." });
 });
 
-app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext dbContext) =>
+app.MapPost("/api/auth/login", (LoginRequest request) =>
 {
     if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
     {
@@ -80,126 +74,87 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext dbConte
     var normalizedEmail = request.Email.Trim().ToLowerInvariant();
     var passwordHash = request.Password.Trim();
 
-    var user = await dbContext.Users
-        .FirstOrDefaultAsync(existingUser =>
-            existingUser.Email == normalizedEmail &&
+    lock (stateLock)
+    {
+        var users = LoadUsers(usersFilePath);
+        var user = users.FirstOrDefault(existingUser =>
+            existingUser.Email.Equals(normalizedEmail, StringComparison.OrdinalIgnoreCase) &&
             existingUser.PasswordHash == passwordHash);
 
-    if (user is null)
-    {
-        return Results.Unauthorized();
-    }
-
-    var token = Guid.NewGuid().ToString("N");
-    tokensByValue[token] = user.Id;
-
-    return Results.Ok(new
-    {
-        token,
-        email = user.Email,
-    });
-});
-
-app.MapGet("/api/devices", async (HttpRequest request, AppDbContext dbContext) =>
-{
-    var user = await TryGetAuthorizedUserAsync(request, dbContext, tokensByValue);
-
-    if (user is null)
-    {
-        return Results.Unauthorized();
-    }
-
-    var devices = await dbContext.Devices
-        .AsNoTracking()
-        .Include(device => device.Drives)
-        .Where(device => device.UserId == user.Id)
-        .OrderByDescending(device => device.LastSeenAt)
-        .ToListAsync();
-
-    return Results.Ok(devices);
-});
-
-app.MapPost("/api/devices/system-info", async (
-    HttpRequest request,
-    DeviceSystemInfoRequest incomingDevice,
-    AppDbContext dbContext) =>
-{
-    var user = await TryGetAuthorizedUserAsync(request, dbContext, tokensByValue);
-
-    if (user is null)
-    {
-        return Results.Unauthorized();
-    }
-
-    var normalizedDeviceId = ValueOrUnknown(incomingDevice.DeviceId);
-
-    var device = await dbContext.Devices
-        .Include(existingDevice => existingDevice.Drives)
-        .FirstOrDefaultAsync(existingDevice =>
-            existingDevice.UserId == user.Id &&
-            existingDevice.DeviceId == normalizedDeviceId);
-
-    if (device is null)
-    {
-        device = new Device
+        if (user is null)
         {
-            Id = Guid.NewGuid(),
-            UserId = user.Id,
-            DeviceId = normalizedDeviceId,
-        };
+            return Results.Unauthorized();
+        }
 
-        dbContext.Devices.Add(device);
-    }
+        var token = Guid.NewGuid().ToString("N");
+        tokensByValue[token] = user.Id;
 
-    device.DeviceName = ValueOrUnknown(incomingDevice.DeviceName);
-    device.Processor = ValueOrUnknown(incomingDevice.Processor);
-    device.ProcessorSpeed = ValueOrUnknown(incomingDevice.ProcessorSpeed);
-    device.InstalledRam = ValueOrUnknown(incomingDevice.InstalledRam);
-    device.UsableRam = ValueOrUnknown(incomingDevice.UsableRam);
-    device.GraphicsCard = ValueOrUnknown(incomingDevice.GraphicsCard);
-    device.GraphicsMemory = ValueOrUnknown(incomingDevice.GraphicsMemory);
-    device.TotalStorage = ValueOrUnknown(incomingDevice.TotalStorage);
-    device.UsedStorage = ValueOrUnknown(incomingDevice.UsedStorage);
-    device.FreeStorage = ValueOrUnknown(incomingDevice.FreeStorage);
-    device.ProductId = ValueOrUnknown(incomingDevice.ProductId);
-    device.SystemType = ValueOrUnknown(incomingDevice.SystemType);
-    device.WindowsEdition = ValueOrUnknown(incomingDevice.WindowsEdition);
-    device.WindowsVersion = ValueOrUnknown(incomingDevice.WindowsVersion);
-    device.OsBuild = ValueOrUnknown(incomingDevice.OsBuild);
-    device.InstalledOn = ValueOrUnknown(incomingDevice.InstalledOn);
-    device.Status = string.IsNullOrWhiteSpace(incomingDevice.Status)
-        ? "Online"
-        : incomingDevice.Status.Trim();
-    device.LastSeenAt = DateTimeOffset.UtcNow.ToString("O");
-
-    dbContext.DeviceDrives.RemoveRange(device.Drives);
-    device.Drives.Clear();
-
-    foreach (var drive in incomingDevice.Drives ?? new List<DriveInfoRequest>())
-    {
-        device.Drives.Add(new DeviceDrive
+        return Results.Ok(new
         {
-            Id = Guid.NewGuid(),
-            DeviceEntityId = device.Id,
-            DriveLetter = ValueOrUnknown(drive.DriveLetter),
-            DriveType = ValueOrUnknown(drive.DriveType),
-            FileSystem = ValueOrUnknown(drive.FileSystem),
-            VolumeLabel = ValueOrUnknown(drive.VolumeLabel),
-            TotalSize = ValueOrUnknown(drive.TotalSize),
-            UsedSpace = ValueOrUnknown(drive.UsedSpace),
-            FreeSpace = ValueOrUnknown(drive.FreeSpace),
+            token,
+            email = user.Email,
         });
     }
+});
 
-    await dbContext.SaveChangesAsync();
+app.MapGet("/api/devices", (HttpRequest request) =>
+{
+    var user = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
 
-    var responseDevice = await dbContext.Devices
-        .AsNoTracking()
-        .Include(savedDevice => savedDevice.Drives)
-        .FirstAsync(savedDevice => savedDevice.Id == device.Id);
+    if (user is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    lock (stateLock)
+    {
+        if (!devicesByUserId.TryGetValue(user.Id, out var devices) || devices.Count == 0)
+        {
+            return Results.Ok(Array.Empty<object>());
+        }
+
+        return Results.Ok(devices);
+    }
+});
+
+app.MapPost("/api/devices/system-info", (HttpRequest request, DeviceSystemInfoRequest incomingDevice) =>
+{
+    var user = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
+
+    if (user is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    DeviceRecord storedDevice;
+
+    lock (stateLock)
+    {
+        if (!devicesByUserId.TryGetValue(user.Id, out var userDevices))
+        {
+            userDevices = new List<DeviceRecord>();
+            devicesByUserId[user.Id] = userDevices;
+        }
+
+        var existingDevice = userDevices.FirstOrDefault(device =>
+            !string.IsNullOrWhiteSpace(incomingDevice.DeviceId) &&
+            device.DeviceId.Equals(incomingDevice.DeviceId, StringComparison.OrdinalIgnoreCase));
+
+        storedDevice = BuildDeviceRecord(incomingDevice, existingDevice?.Id);
+
+        if (existingDevice is null)
+        {
+            userDevices.Add(storedDevice);
+        }
+        else
+        {
+            var index = userDevices.IndexOf(existingDevice);
+            userDevices[index] = storedDevice;
+        }
+    }
 
     Console.WriteLine("Received and saved system info:");
-    Console.WriteLine(JsonSerializer.Serialize(responseDevice, new JsonSerializerOptions
+    Console.WriteLine(JsonSerializer.Serialize(storedDevice, new JsonSerializerOptions
     {
         WriteIndented = true
     }));
@@ -207,16 +162,17 @@ app.MapPost("/api/devices/system-info", async (
     return Results.Ok(new
     {
         message = "System info saved successfully",
-        device = responseDevice,
+        device = storedDevice,
     });
 });
 
 app.Run();
 
-static async Task<User?> TryGetAuthorizedUserAsync(
+static StoredUser? TryGetAuthorizedUser(
     HttpRequest request,
-    AppDbContext dbContext,
-    Dictionary<string, Guid> tokensByValue)
+    string usersFilePath,
+    Dictionary<string, string> tokensByValue,
+    object stateLock)
 {
     if (!request.Headers.TryGetValue("Authorization", out var authorizationHeader))
     {
@@ -232,38 +188,85 @@ static async Task<User?> TryGetAuthorizedUserAsync(
 
     var token = headerValue[7..].Trim();
 
-    if (string.IsNullOrWhiteSpace(token) || !tokensByValue.TryGetValue(token, out var userId))
+    lock (stateLock)
     {
-        return null;
-    }
+        if (string.IsNullOrWhiteSpace(token) || !tokensByValue.TryGetValue(token, out var userId))
+        {
+            return null;
+        }
 
-    return await dbContext.Users.FirstOrDefaultAsync(user => user.Id == userId);
+        var users = LoadUsers(usersFilePath);
+        return users.FirstOrDefault(user => user.Id == userId);
+    }
 }
 
-static string BuildConnectionString(string rawConnectionString)
+static DeviceRecord BuildDeviceRecord(DeviceSystemInfoRequest request, string? existingId)
 {
-    if (!rawConnectionString.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase) &&
-        !rawConnectionString.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase))
+    return new DeviceRecord(
+        existingId ?? Guid.NewGuid().ToString("N"),
+        ValueOrUnknown(request.DeviceName),
+        ValueOrUnknown(request.Processor),
+        ValueOrUnknown(request.ProcessorSpeed),
+        ValueOrUnknown(request.InstalledRam),
+        ValueOrUnknown(request.UsableRam),
+        ValueOrUnknown(request.GraphicsCard),
+        ValueOrUnknown(request.GraphicsMemory),
+        ValueOrUnknown(request.TotalStorage),
+        ValueOrUnknown(request.UsedStorage),
+        ValueOrUnknown(request.FreeStorage),
+        ValueOrUnknown(request.DeviceId),
+        ValueOrUnknown(request.ProductId),
+        ValueOrUnknown(request.SystemType),
+        ValueOrUnknown(request.WindowsEdition),
+        ValueOrUnknown(request.WindowsVersion),
+        ValueOrUnknown(request.OsBuild),
+        ValueOrUnknown(request.InstalledOn),
+        string.IsNullOrWhiteSpace(request.Status) ? "Online" : request.Status.Trim(),
+        DateTimeOffset.UtcNow.ToString("O"),
+        (request.Drives ?? new List<DriveInfoRequest>())
+            .Select(drive => new DriveInfoRequest(
+                ValueOrUnknown(drive.DriveLetter),
+                ValueOrUnknown(drive.DriveType),
+                ValueOrUnknown(drive.FileSystem),
+                ValueOrUnknown(drive.VolumeLabel),
+                ValueOrUnknown(drive.TotalSize),
+                ValueOrUnknown(drive.UsedSpace),
+                ValueOrUnknown(drive.FreeSpace)))
+            .ToList());
+}
+
+static void EnsureUsersFileExists(string usersFilePath)
+{
+    if (File.Exists(usersFilePath))
     {
-        return rawConnectionString;
+        return;
     }
 
-    var connectionUri = new Uri(rawConnectionString);
-    var userInfoParts = connectionUri.UserInfo.Split(':', 2);
-    var databaseName = connectionUri.AbsolutePath.Trim('/');
+    File.WriteAllText(usersFilePath, "[]");
+}
 
-    var builder = new NpgsqlConnectionStringBuilder
+static List<StoredUser> LoadUsers(string usersFilePath)
+{
+    try
     {
-        Host = connectionUri.Host,
-        Port = connectionUri.Port,
-        Username = userInfoParts.ElementAtOrDefault(0) ?? string.Empty,
-        Password = userInfoParts.ElementAtOrDefault(1) ?? string.Empty,
-        Database = string.IsNullOrWhiteSpace(databaseName) ? "postgres" : databaseName,
-        SslMode = SslMode.Require,
-        TrustServerCertificate = true,
-    };
+        var json = File.ReadAllText(usersFilePath);
+        var users = JsonSerializer.Deserialize<List<StoredUser>>(json);
+        return users ?? new List<StoredUser>();
+    }
+    catch
+    {
+        return new List<StoredUser>();
+    }
+}
 
-    return builder.ConnectionString;
+static void SaveUsers(string usersFilePath, List<StoredUser> users)
+{
+    var json = JsonSerializer.Serialize(users, new JsonSerializerOptions
+    {
+        WriteIndented = true
+    });
+
+    File.WriteAllText(usersFilePath, json);
 }
 
 static string ValueOrUnknown(string? value)
@@ -274,6 +277,37 @@ static string ValueOrUnknown(string? value)
 record RegisterRequest(string? Email, string? Password);
 
 record LoginRequest(string? Email, string? Password);
+
+record StoredUser(
+    string Id,
+    string Email,
+    string PasswordHash,
+    DateTime CreatedAt
+);
+
+record DeviceRecord(
+    string Id,
+    string DeviceName,
+    string Processor,
+    string ProcessorSpeed,
+    string InstalledRam,
+    string UsableRam,
+    string GraphicsCard,
+    string GraphicsMemory,
+    string TotalStorage,
+    string UsedStorage,
+    string FreeStorage,
+    string DeviceId,
+    string ProductId,
+    string SystemType,
+    string WindowsEdition,
+    string WindowsVersion,
+    string OsBuild,
+    string InstalledOn,
+    string Status,
+    string LastSeenAt,
+    List<DriveInfoRequest> Drives
+);
 
 record DeviceSystemInfoRequest(
     string? DeviceName,
