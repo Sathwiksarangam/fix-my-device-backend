@@ -52,16 +52,22 @@ app.MapPost("/api/auth/register", (RegisterRequest request) =>
             return Results.Conflict(new { message = "User already exists." });
         }
 
-        users.Add(new StoredUser(
+        var createdUser = new StoredUser(
             Guid.NewGuid().ToString("N"),
             normalizedEmail,
             request.Password.Trim(),
-            DateTime.UtcNow));
+            DateTime.UtcNow,
+            GenerateAgentSetupCode());
 
+        users.Add(createdUser);
         SaveUsers(usersFilePath, users);
-    }
 
-    return Results.Ok(new { message = "User registered successfully." });
+        return Results.Ok(new
+        {
+            message = "User registered successfully",
+            agentSetupCode = createdUser.AgentSetupCode,
+        });
+    }
 });
 
 app.MapPost("/api/auth/login", (LoginRequest request) =>
@@ -77,14 +83,18 @@ app.MapPost("/api/auth/login", (LoginRequest request) =>
     lock (stateLock)
     {
         var users = LoadUsers(usersFilePath);
-        var user = users.FirstOrDefault(existingUser =>
+        var index = users.FindIndex(existingUser =>
             existingUser.Email.Equals(normalizedEmail, StringComparison.OrdinalIgnoreCase) &&
             existingUser.PasswordHash == passwordHash);
 
-        if (user is null)
+        if (index < 0)
         {
             return Results.Unauthorized();
         }
+
+        var user = EnsureUserHasSetupCode(users[index]);
+        users[index] = user;
+        SaveUsers(usersFilePath, users);
 
         var token = Guid.NewGuid().ToString("N");
         tokensByValue[token] = user.Id;
@@ -93,6 +103,37 @@ app.MapPost("/api/auth/login", (LoginRequest request) =>
         {
             token,
             email = user.Email,
+            agentSetupCode = user.AgentSetupCode,
+        });
+    }
+});
+
+app.MapGet("/api/agent/setup-code", (HttpRequest request) =>
+{
+    var user = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
+
+    if (user is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    lock (stateLock)
+    {
+        var users = LoadUsers(usersFilePath);
+        var index = users.FindIndex(existingUser => existingUser.Id == user.Id);
+
+        if (index < 0)
+        {
+            return Results.Unauthorized();
+        }
+
+        var updatedUser = EnsureUserHasSetupCode(users[index]);
+        users[index] = updatedUser;
+        SaveUsers(usersFilePath, users);
+
+        return Results.Ok(new
+        {
+            agentSetupCode = updatedUser.AgentSetupCode,
         });
     }
 });
@@ -108,7 +149,7 @@ app.MapGet("/api/devices", (HttpRequest request) =>
 
     lock (stateLock)
     {
-        if (!devicesByUserId.TryGetValue(user.Id, out var devices) || devices.Count == 0)
+        if (!devicesByUserId.TryGetValue(user.Id, out var devices) || devices is null || devices.Count == 0)
         {
             return Results.Ok(Array.Empty<object>());
         }
@@ -119,7 +160,17 @@ app.MapGet("/api/devices", (HttpRequest request) =>
 
 app.MapPost("/api/devices/system-info", (HttpRequest request, DeviceSystemInfoRequest incomingDevice) =>
 {
-    var user = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
+    if (incomingDevice is null)
+    {
+        return Results.BadRequest(new { message = "Device payload is required." });
+    }
+
+    var user = TryResolveDeviceOwner(
+        request,
+        incomingDevice,
+        usersFilePath,
+        tokensByValue,
+        stateLock);
 
     if (user is null)
     {
@@ -130,15 +181,15 @@ app.MapPost("/api/devices/system-info", (HttpRequest request, DeviceSystemInfoRe
 
     lock (stateLock)
     {
-        if (!devicesByUserId.TryGetValue(user.Id, out var userDevices))
+        if (!devicesByUserId.TryGetValue(user.Id, out var userDevices) || userDevices is null)
         {
             userDevices = new List<DeviceRecord>();
             devicesByUserId[user.Id] = userDevices;
         }
 
+        var normalizedDeviceId = ValueOrUnknown(incomingDevice.DeviceId);
         var existingDevice = userDevices.FirstOrDefault(device =>
-            !string.IsNullOrWhiteSpace(incomingDevice.DeviceId) &&
-            device.DeviceId.Equals(incomingDevice.DeviceId, StringComparison.OrdinalIgnoreCase));
+            device.DeviceId.Equals(normalizedDeviceId, StringComparison.OrdinalIgnoreCase));
 
         storedDevice = BuildDeviceRecord(incomingDevice, existingDevice?.Id);
 
@@ -149,14 +200,22 @@ app.MapPost("/api/devices/system-info", (HttpRequest request, DeviceSystemInfoRe
         else
         {
             var index = userDevices.IndexOf(existingDevice);
-            userDevices[index] = storedDevice;
+
+            if (index >= 0)
+            {
+                userDevices[index] = storedDevice;
+            }
+            else
+            {
+                userDevices.Add(storedDevice);
+            }
         }
     }
 
     Console.WriteLine("Received and saved system info:");
     Console.WriteLine(JsonSerializer.Serialize(storedDevice, new JsonSerializerOptions
     {
-        WriteIndented = true
+        WriteIndented = true,
     }));
 
     return Results.Ok(new
@@ -167,6 +226,35 @@ app.MapPost("/api/devices/system-info", (HttpRequest request, DeviceSystemInfoRe
 });
 
 app.Run();
+
+static StoredUser? TryResolveDeviceOwner(
+    HttpRequest request,
+    DeviceSystemInfoRequest incomingDevice,
+    string usersFilePath,
+    Dictionary<string, string> tokensByValue,
+    object stateLock)
+{
+    var authorizedUser = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
+
+    if (authorizedUser is not null)
+    {
+        return authorizedUser;
+    }
+
+    var normalizedSetupCode = NormalizeSetupCode(incomingDevice.AgentSetupCode);
+
+    if (string.IsNullOrWhiteSpace(normalizedSetupCode))
+    {
+        return null;
+    }
+
+    lock (stateLock)
+    {
+        var users = LoadUsers(usersFilePath);
+        return users.FirstOrDefault(user =>
+            NormalizeSetupCode(user.AgentSetupCode) == normalizedSetupCode);
+    }
+}
 
 static StoredUser? TryGetAuthorizedUser(
     HttpRequest request,
@@ -181,7 +269,8 @@ static StoredUser? TryGetAuthorizedUser(
 
     var headerValue = authorizationHeader.ToString();
 
-    if (!headerValue.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+    if (string.IsNullOrWhiteSpace(headerValue) ||
+        !headerValue.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
     {
         return null;
     }
@@ -198,6 +287,22 @@ static StoredUser? TryGetAuthorizedUser(
         var users = LoadUsers(usersFilePath);
         return users.FirstOrDefault(user => user.Id == userId);
     }
+}
+
+static StoredUser EnsureUserHasSetupCode(StoredUser user)
+{
+    if (!string.IsNullOrWhiteSpace(user.AgentSetupCode))
+    {
+        return user with
+        {
+            AgentSetupCode = NormalizeSetupCode(user.AgentSetupCode),
+        };
+    }
+
+    return user with
+    {
+        AgentSetupCode = GenerateAgentSetupCode(),
+    };
 }
 
 static DeviceRecord BuildDeviceRecord(DeviceSystemInfoRequest request, string? existingId)
@@ -235,6 +340,19 @@ static DeviceRecord BuildDeviceRecord(DeviceSystemInfoRequest request, string? e
             .ToList());
 }
 
+static string GenerateAgentSetupCode()
+{
+    var raw = Guid.NewGuid().ToString("N").ToUpperInvariant();
+    return $"FMD-{raw[..4]}-{raw[4..8]}";
+}
+
+static string NormalizeSetupCode(string? setupCode)
+{
+    return string.IsNullOrWhiteSpace(setupCode)
+        ? string.Empty
+        : setupCode.Trim().ToUpperInvariant();
+}
+
 static void EnsureUsersFileExists(string usersFilePath)
 {
     if (File.Exists(usersFilePath))
@@ -263,7 +381,7 @@ static void SaveUsers(string usersFilePath, List<StoredUser> users)
 {
     var json = JsonSerializer.Serialize(users, new JsonSerializerOptions
     {
-        WriteIndented = true
+        WriteIndented = true,
     });
 
     File.WriteAllText(usersFilePath, json);
@@ -282,8 +400,8 @@ record StoredUser(
     string Id,
     string Email,
     string PasswordHash,
-    DateTime CreatedAt
-);
+    DateTime CreatedAt,
+    string? AgentSetupCode = null);
 
 record DeviceRecord(
     string Id,
@@ -306,10 +424,10 @@ record DeviceRecord(
     string InstalledOn,
     string Status,
     string LastSeenAt,
-    List<DriveInfoRequest> Drives
-);
+    List<DriveInfoRequest> Drives);
 
 record DeviceSystemInfoRequest(
+    string? AgentSetupCode,
     string? DeviceName,
     string? Processor,
     string? ProcessorSpeed,
@@ -329,8 +447,7 @@ record DeviceSystemInfoRequest(
     string? InstalledOn,
     string? Status,
     string? LastSeenAt,
-    List<DriveInfoRequest>? Drives
-);
+    List<DriveInfoRequest>? Drives);
 
 record DriveInfoRequest(
     string? DriveLetter,
@@ -339,5 +456,4 @@ record DriveInfoRequest(
     string? VolumeLabel,
     string? TotalSize,
     string? UsedSpace,
-    string? FreeSpace
-);
+    string? FreeSpace);
