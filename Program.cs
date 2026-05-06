@@ -1,4 +1,7 @@
+using System.Data;
 using System.Text.Json;
+using Microsoft.AspNetCore.StaticFiles;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -15,14 +18,13 @@ builder.Services.AddCors(options =>
     });
 });
 
+var connectionString = Environment.GetEnvironmentVariable("SUPABASE_DB_CONNECTION");
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    throw new InvalidOperationException("SUPABASE_DB_CONNECTION environment variable is missing.");
+}
+
 var app = builder.Build();
-
-var usersFilePath = Path.Combine(app.Environment.ContentRootPath, "users.json");
-var tokensByValue = new Dictionary<string, string>(StringComparer.Ordinal);
-var devicesByUserId = new Dictionary<string, List<DeviceRecord>>(StringComparer.Ordinal);
-var stateLock = new object();
-
-EnsureUsersFileExists(usersFilePath);
 
 if (app.Environment.IsDevelopment())
 {
@@ -30,11 +32,28 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+var contentTypeProvider = new FileExtensionContentTypeProvider();
+contentTypeProvider.Mappings[".exe"] = "application/octet-stream";
+
+app.UseStaticFiles(new StaticFileOptions
+{
+    ContentTypeProvider = contentTypeProvider,
+    OnPrepareResponse = context =>
+    {
+        if (context.Context.Request.Path.StartsWithSegments("/downloads"))
+        {
+            var fileName = Path.GetFileName(context.File.Name);
+            context.Context.Response.Headers.ContentDisposition =
+                $"attachment; filename=\"{fileName}\"";
+        }
+    },
+});
+
 app.UseCors("AllowFlutterApp");
 
 app.MapGet("/", () => "Fix My Device API is running");
 
-app.MapPost("/api/auth/register", (RegisterRequest request) =>
+app.MapPost("/api/auth/register", async (RegisterRequest request) =>
 {
     if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
     {
@@ -42,35 +61,57 @@ app.MapPost("/api/auth/register", (RegisterRequest request) =>
     }
 
     var normalizedEmail = request.Email.Trim().ToLowerInvariant();
+    var passwordHash = request.Password.Trim();
+    var token = Guid.NewGuid().ToString("N");
+    var agentSetupCode = GenerateAgentSetupCode();
+    var userId = Guid.NewGuid();
+    var createdAt = DateTimeOffset.UtcNow;
 
-    lock (stateLock)
+    await using var connection = new NpgsqlConnection(connectionString);
+    await connection.OpenAsync();
+
+    await using var existsCommand = new NpgsqlCommand(
+        """
+        select 1
+        from app_users
+        where lower(email) = @email
+        limit 1
+        """,
+        connection);
+    existsCommand.Parameters.AddWithValue("email", normalizedEmail);
+
+    var existingUser = await existsCommand.ExecuteScalarAsync();
+    if (existingUser is not null)
     {
-        var users = LoadUsers(usersFilePath);
-
-        if (users.Any(user => user.Email.Equals(normalizedEmail, StringComparison.OrdinalIgnoreCase)))
-        {
-            return Results.Conflict(new { message = "User already exists." });
-        }
-
-        var createdUser = new StoredUser(
-            Guid.NewGuid().ToString("N"),
-            normalizedEmail,
-            request.Password.Trim(),
-            DateTime.UtcNow,
-            GenerateAgentSetupCode());
-
-        users.Add(createdUser);
-        SaveUsers(usersFilePath, users);
-
-        return Results.Ok(new
-        {
-            message = "User registered successfully",
-            agentSetupCode = createdUser.AgentSetupCode,
-        });
+        return Results.Conflict(new { message = "User already exists." });
     }
+
+    await using var insertCommand = new NpgsqlCommand(
+        """
+        insert into app_users (id, email, password_hash, token, agent_setup_code, created_at)
+        values (@id, @email, @password_hash, @token, @agent_setup_code, @created_at)
+        """,
+        connection);
+
+    insertCommand.Parameters.AddWithValue("id", userId);
+    insertCommand.Parameters.AddWithValue("email", normalizedEmail);
+    insertCommand.Parameters.AddWithValue("password_hash", passwordHash);
+    insertCommand.Parameters.AddWithValue("token", token);
+    insertCommand.Parameters.AddWithValue("agent_setup_code", agentSetupCode);
+    insertCommand.Parameters.AddWithValue("created_at", createdAt);
+
+    await insertCommand.ExecuteNonQueryAsync();
+
+    return Results.Ok(new
+    {
+        message = "User registered successfully",
+        token,
+        email = normalizedEmail,
+        agentSetupCode,
+    });
 });
 
-app.MapPost("/api/auth/login", (LoginRequest request) =>
+app.MapPost("/api/auth/login", async (LoginRequest request) =>
 {
     if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
     {
@@ -80,143 +121,266 @@ app.MapPost("/api/auth/login", (LoginRequest request) =>
     var normalizedEmail = request.Email.Trim().ToLowerInvariant();
     var passwordHash = request.Password.Trim();
 
-    lock (stateLock)
+    await using var connection = new NpgsqlConnection(connectionString);
+    await connection.OpenAsync();
+
+    await using var selectCommand = new NpgsqlCommand(
+        """
+        select id, email, token, agent_setup_code
+        from app_users
+        where lower(email) = @email and password_hash = @password_hash
+        limit 1
+        """,
+        connection);
+
+    selectCommand.Parameters.AddWithValue("email", normalizedEmail);
+    selectCommand.Parameters.AddWithValue("password_hash", passwordHash);
+
+    await using var reader = await selectCommand.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
     {
-        var users = LoadUsers(usersFilePath);
-        var index = users.FindIndex(existingUser =>
-            existingUser.Email.Equals(normalizedEmail, StringComparison.OrdinalIgnoreCase) &&
-            existingUser.PasswordHash == passwordHash);
-
-        if (index < 0)
-        {
-            return Results.Unauthorized();
-        }
-
-        var user = EnsureUserHasSetupCode(users[index]);
-        users[index] = user;
-        SaveUsers(usersFilePath, users);
-
-        var token = Guid.NewGuid().ToString("N");
-        tokensByValue[token] = user.Id;
-
-        return Results.Ok(new
-        {
-            token,
-            email = user.Email,
-            agentSetupCode = user.AgentSetupCode,
-        });
+        return Results.Unauthorized();
     }
+
+    var userId = reader.GetGuid(reader.GetOrdinal("id"));
+    var email = reader.GetString(reader.GetOrdinal("email"));
+    var token = reader.IsDBNull(reader.GetOrdinal("token"))
+        ? string.Empty
+        : reader.GetString(reader.GetOrdinal("token"));
+    var agentSetupCode = reader.IsDBNull(reader.GetOrdinal("agent_setup_code"))
+        ? string.Empty
+        : reader.GetString(reader.GetOrdinal("agent_setup_code"));
+    await reader.CloseAsync();
+
+    if (string.IsNullOrWhiteSpace(token))
+    {
+        token = Guid.NewGuid().ToString("N");
+    }
+
+    if (string.IsNullOrWhiteSpace(agentSetupCode))
+    {
+        agentSetupCode = GenerateAgentSetupCode();
+    }
+
+    await using var updateCommand = new NpgsqlCommand(
+        """
+        update app_users
+        set token = @token,
+            agent_setup_code = @agent_setup_code
+        where id = @id
+        """,
+        connection);
+
+    updateCommand.Parameters.AddWithValue("id", userId);
+    updateCommand.Parameters.AddWithValue("token", token);
+    updateCommand.Parameters.AddWithValue("agent_setup_code", agentSetupCode);
+    await updateCommand.ExecuteNonQueryAsync();
+
+    return Results.Ok(new
+    {
+        token,
+        email,
+        agentSetupCode,
+    });
 });
 
-app.MapGet("/api/agent/setup-code", (HttpRequest request) =>
+app.MapGet("/api/agent/setup-code", async (HttpRequest request) =>
 {
-    var user = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
-
+    var user = await TryGetAuthorizedUserAsync(request, connectionString);
     if (user is null)
     {
         return Results.Unauthorized();
     }
 
-    lock (stateLock)
+    var agentSetupCode = string.IsNullOrWhiteSpace(user.AgentSetupCode)
+        ? GenerateAgentSetupCode()
+        : user.AgentSetupCode;
+
+    if (agentSetupCode != user.AgentSetupCode)
     {
-        var users = LoadUsers(usersFilePath);
-        var index = users.FindIndex(existingUser => existingUser.Id == user.Id);
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
 
-        if (index < 0)
-        {
-            return Results.Unauthorized();
-        }
-
-        var updatedUser = EnsureUserHasSetupCode(users[index]);
-        users[index] = updatedUser;
-        SaveUsers(usersFilePath, users);
-
-        return Results.Ok(new
-        {
-            agentSetupCode = updatedUser.AgentSetupCode,
-        });
+        await using var updateCommand = new NpgsqlCommand(
+            "update app_users set agent_setup_code = @agent_setup_code where id = @id",
+            connection);
+        updateCommand.Parameters.AddWithValue("agent_setup_code", agentSetupCode);
+        updateCommand.Parameters.AddWithValue("id", user.Id);
+        await updateCommand.ExecuteNonQueryAsync();
     }
+
+    return Results.Ok(new
+    {
+        agentSetupCode,
+    });
 });
 
-app.MapGet("/api/devices", (HttpRequest request) =>
+app.MapGet("/api/devices", async (HttpRequest request) =>
 {
-    var user = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
-
+    var user = await TryGetAuthorizedUserAsync(request, connectionString);
     if (user is null)
     {
         return Results.Unauthorized();
     }
 
-    lock (stateLock)
-    {
-        if (!devicesByUserId.TryGetValue(user.Id, out var devices) || devices is null || devices.Count == 0)
-        {
-            return Results.Ok(Array.Empty<object>());
-        }
+    var devices = new List<DeviceRecord>();
 
-        return Results.Ok(devices);
+    await using var connection = new NpgsqlConnection(connectionString);
+    await connection.OpenAsync();
+
+    await using var command = new NpgsqlCommand(
+        """
+        select id, user_id, device_name, processor, processor_speed, installed_ram,
+               usable_ram, graphics_card, graphics_memory, total_storage, used_storage,
+               free_storage, device_id, product_id, system_type, windows_edition,
+               windows_version, os_build, installed_on, status, last_seen_at, drives_json
+        from devices
+        where user_id = @user_id
+        order by last_seen_at desc nulls last
+        """,
+        connection);
+    command.Parameters.AddWithValue("user_id", user.Id);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        devices.Add(new DeviceRecord(
+            reader["id"]?.ToString() ?? string.Empty,
+            reader["device_name"]?.ToString() ?? "Unknown",
+            reader["processor"]?.ToString() ?? "Unknown",
+            reader["processor_speed"]?.ToString() ?? "Unknown",
+            reader["installed_ram"]?.ToString() ?? "Unknown",
+            reader["usable_ram"]?.ToString() ?? "Unknown",
+            reader["graphics_card"]?.ToString() ?? "Unknown",
+            reader["graphics_memory"]?.ToString() ?? "Unknown",
+            reader["total_storage"]?.ToString() ?? "Unknown",
+            reader["used_storage"]?.ToString() ?? "Unknown",
+            reader["free_storage"]?.ToString() ?? "Unknown",
+            reader["device_id"]?.ToString() ?? "Unknown",
+            reader["product_id"]?.ToString() ?? "Unknown",
+            reader["system_type"]?.ToString() ?? "Unknown",
+            reader["windows_edition"]?.ToString() ?? "Unknown",
+            reader["windows_version"]?.ToString() ?? "Unknown",
+            reader["os_build"]?.ToString() ?? "Unknown",
+            reader["installed_on"]?.ToString() ?? "Unknown",
+            reader["status"]?.ToString() ?? "Online",
+            ReadDateTimeAsIsoString(reader, "last_seen_at"),
+            DeserializeDrives(reader["drives_json"]?.ToString())));
     }
+
+    return Results.Ok(devices);
 });
 
-app.MapPost("/api/devices/system-info", (HttpRequest request, DeviceSystemInfoRequest incomingDevice) =>
+app.MapPost("/api/devices/system-info-by-code", async (DeviceSystemInfoRequest incomingDevice) =>
 {
-    if (incomingDevice is null)
+    if (incomingDevice is null || string.IsNullOrWhiteSpace(incomingDevice.AgentSetupCode))
     {
-        return Results.BadRequest(new { message = "Device payload is required." });
+        return Results.BadRequest(new { message = "Agent setup code is required." });
     }
 
-    var user = TryResolveDeviceOwner(
-        request,
-        incomingDevice,
-        usersFilePath,
-        tokensByValue,
-        stateLock);
+    await using var connection = new NpgsqlConnection(connectionString);
+    await connection.OpenAsync();
 
+    var user = await FindUserBySetupCodeAsync(connection, incomingDevice.AgentSetupCode);
     if (user is null)
     {
         return Results.Unauthorized();
     }
 
-    DeviceRecord storedDevice;
+    var normalizedDeviceId = ValueOrUnknown(incomingDevice.DeviceId);
+    var storedDeviceId = await FindExistingDeviceRowIdAsync(connection, user.Id, normalizedDeviceId)
+        ?? Guid.NewGuid().ToString("N");
 
-    lock (stateLock)
-    {
-        if (!devicesByUserId.TryGetValue(user.Id, out var userDevices) || userDevices is null)
-        {
-            userDevices = new List<DeviceRecord>();
-            devicesByUserId[user.Id] = userDevices;
-        }
+    var drives = NormalizeDrives(incomingDevice.Drives);
+    var drivesJson = JsonSerializer.Serialize(drives);
+    var lastSeenAt = DateTimeOffset.UtcNow;
+    var status = string.IsNullOrWhiteSpace(incomingDevice.Status) ? "Online" : incomingDevice.Status.Trim();
 
-        var normalizedDeviceId = ValueOrUnknown(incomingDevice.DeviceId);
-        var existingDevice = userDevices.FirstOrDefault(device =>
-            device.DeviceId.Equals(normalizedDeviceId, StringComparison.OrdinalIgnoreCase));
+    var upsertSql = await FindExistingDeviceRowIdAsync(connection, user.Id, normalizedDeviceId) is null
+        ? """
+          insert into devices (
+              id, user_id, device_name, processor, processor_speed, installed_ram,
+              usable_ram, graphics_card, graphics_memory, total_storage, used_storage,
+              free_storage, device_id, product_id, system_type, windows_edition,
+              windows_version, os_build, installed_on, status, last_seen_at, drives_json)
+          values (
+              @id, @user_id, @device_name, @processor, @processor_speed, @installed_ram,
+              @usable_ram, @graphics_card, @graphics_memory, @total_storage, @used_storage,
+              @free_storage, @device_id, @product_id, @system_type, @windows_edition,
+              @windows_version, @os_build, @installed_on, @status, @last_seen_at, @drives_json)
+          """
+        : """
+          update devices
+          set device_name = @device_name,
+              processor = @processor,
+              processor_speed = @processor_speed,
+              installed_ram = @installed_ram,
+              usable_ram = @usable_ram,
+              graphics_card = @graphics_card,
+              graphics_memory = @graphics_memory,
+              total_storage = @total_storage,
+              used_storage = @used_storage,
+              free_storage = @free_storage,
+              product_id = @product_id,
+              system_type = @system_type,
+              windows_edition = @windows_edition,
+              windows_version = @windows_version,
+              os_build = @os_build,
+              installed_on = @installed_on,
+              status = @status,
+              last_seen_at = @last_seen_at,
+              drives_json = @drives_json
+          where id = @id and user_id = @user_id
+          """;
 
-        storedDevice = BuildDeviceRecord(incomingDevice, existingDevice?.Id);
+    await using var upsertCommand = new NpgsqlCommand(upsertSql, connection);
+    upsertCommand.Parameters.AddWithValue("id", storedDeviceId);
+    upsertCommand.Parameters.AddWithValue("user_id", user.Id);
+    upsertCommand.Parameters.AddWithValue("device_name", ValueOrUnknown(incomingDevice.DeviceName));
+    upsertCommand.Parameters.AddWithValue("processor", ValueOrUnknown(incomingDevice.Processor));
+    upsertCommand.Parameters.AddWithValue("processor_speed", ValueOrUnknown(incomingDevice.ProcessorSpeed));
+    upsertCommand.Parameters.AddWithValue("installed_ram", ValueOrUnknown(incomingDevice.InstalledRam));
+    upsertCommand.Parameters.AddWithValue("usable_ram", ValueOrUnknown(incomingDevice.UsableRam));
+    upsertCommand.Parameters.AddWithValue("graphics_card", ValueOrUnknown(incomingDevice.GraphicsCard));
+    upsertCommand.Parameters.AddWithValue("graphics_memory", ValueOrUnknown(incomingDevice.GraphicsMemory));
+    upsertCommand.Parameters.AddWithValue("total_storage", ValueOrUnknown(incomingDevice.TotalStorage));
+    upsertCommand.Parameters.AddWithValue("used_storage", ValueOrUnknown(incomingDevice.UsedStorage));
+    upsertCommand.Parameters.AddWithValue("free_storage", ValueOrUnknown(incomingDevice.FreeStorage));
+    upsertCommand.Parameters.AddWithValue("device_id", normalizedDeviceId);
+    upsertCommand.Parameters.AddWithValue("product_id", ValueOrUnknown(incomingDevice.ProductId));
+    upsertCommand.Parameters.AddWithValue("system_type", ValueOrUnknown(incomingDevice.SystemType));
+    upsertCommand.Parameters.AddWithValue("windows_edition", ValueOrUnknown(incomingDevice.WindowsEdition));
+    upsertCommand.Parameters.AddWithValue("windows_version", ValueOrUnknown(incomingDevice.WindowsVersion));
+    upsertCommand.Parameters.AddWithValue("os_build", ValueOrUnknown(incomingDevice.OsBuild));
+    upsertCommand.Parameters.AddWithValue("installed_on", ValueOrUnknown(incomingDevice.InstalledOn));
+    upsertCommand.Parameters.AddWithValue("status", status);
+    upsertCommand.Parameters.AddWithValue("last_seen_at", lastSeenAt);
+    upsertCommand.Parameters.AddWithValue("drives_json", drivesJson);
 
-        if (existingDevice is null)
-        {
-            userDevices.Add(storedDevice);
-        }
-        else
-        {
-            var index = userDevices.IndexOf(existingDevice);
+    await upsertCommand.ExecuteNonQueryAsync();
 
-            if (index >= 0)
-            {
-                userDevices[index] = storedDevice;
-            }
-            else
-            {
-                userDevices.Add(storedDevice);
-            }
-        }
-    }
-
-    Console.WriteLine("Received and saved system info:");
-    Console.WriteLine(JsonSerializer.Serialize(storedDevice, new JsonSerializerOptions
-    {
-        WriteIndented = true,
-    }));
+    var storedDevice = new DeviceRecord(
+        storedDeviceId,
+        ValueOrUnknown(incomingDevice.DeviceName),
+        ValueOrUnknown(incomingDevice.Processor),
+        ValueOrUnknown(incomingDevice.ProcessorSpeed),
+        ValueOrUnknown(incomingDevice.InstalledRam),
+        ValueOrUnknown(incomingDevice.UsableRam),
+        ValueOrUnknown(incomingDevice.GraphicsCard),
+        ValueOrUnknown(incomingDevice.GraphicsMemory),
+        ValueOrUnknown(incomingDevice.TotalStorage),
+        ValueOrUnknown(incomingDevice.UsedStorage),
+        ValueOrUnknown(incomingDevice.FreeStorage),
+        normalizedDeviceId,
+        ValueOrUnknown(incomingDevice.ProductId),
+        ValueOrUnknown(incomingDevice.SystemType),
+        ValueOrUnknown(incomingDevice.WindowsEdition),
+        ValueOrUnknown(incomingDevice.WindowsVersion),
+        ValueOrUnknown(incomingDevice.OsBuild),
+        ValueOrUnknown(incomingDevice.InstalledOn),
+        status,
+        lastSeenAt.ToString("O"),
+        drives);
 
     return Results.Ok(new
     {
@@ -227,40 +391,7 @@ app.MapPost("/api/devices/system-info", (HttpRequest request, DeviceSystemInfoRe
 
 app.Run();
 
-static StoredUser? TryResolveDeviceOwner(
-    HttpRequest request,
-    DeviceSystemInfoRequest incomingDevice,
-    string usersFilePath,
-    Dictionary<string, string> tokensByValue,
-    object stateLock)
-{
-    var authorizedUser = TryGetAuthorizedUser(request, usersFilePath, tokensByValue, stateLock);
-
-    if (authorizedUser is not null)
-    {
-        return authorizedUser;
-    }
-
-    var normalizedSetupCode = NormalizeSetupCode(incomingDevice.AgentSetupCode);
-
-    if (string.IsNullOrWhiteSpace(normalizedSetupCode))
-    {
-        return null;
-    }
-
-    lock (stateLock)
-    {
-        var users = LoadUsers(usersFilePath);
-        return users.FirstOrDefault(user =>
-            NormalizeSetupCode(user.AgentSetupCode) == normalizedSetupCode);
-    }
-}
-
-static StoredUser? TryGetAuthorizedUser(
-    HttpRequest request,
-    string usersFilePath,
-    Dictionary<string, string> tokensByValue,
-    object stateLock)
+static async Task<AppUserRecord?> TryGetAuthorizedUserAsync(HttpRequest request, string connectionString)
 {
     if (!request.Headers.TryGetValue("Authorization", out var authorizationHeader))
     {
@@ -268,7 +399,6 @@ static StoredUser? TryGetAuthorizedUser(
     }
 
     var headerValue = authorizationHeader.ToString();
-
     if (string.IsNullOrWhiteSpace(headerValue) ||
         !headerValue.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
     {
@@ -276,68 +406,118 @@ static StoredUser? TryGetAuthorizedUser(
     }
 
     var token = headerValue[7..].Trim();
-
-    lock (stateLock)
+    if (string.IsNullOrWhiteSpace(token))
     {
-        if (string.IsNullOrWhiteSpace(token) || !tokensByValue.TryGetValue(token, out var userId))
-        {
-            return null;
-        }
+        return null;
+    }
 
-        var users = LoadUsers(usersFilePath);
-        return users.FirstOrDefault(user => user.Id == userId);
+    await using var connection = new NpgsqlConnection(connectionString);
+    await connection.OpenAsync();
+
+    await using var command = new NpgsqlCommand(
+        """
+        select id, email, token, agent_setup_code, created_at
+        from app_users
+        where token = @token
+        limit 1
+        """,
+        connection);
+    command.Parameters.AddWithValue("token", token);
+
+    await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SingleRow);
+    return await reader.ReadAsync() ? ReadAppUser(reader) : null;
+}
+
+static async Task<AppUserRecord?> FindUserBySetupCodeAsync(NpgsqlConnection connection, string? agentSetupCode)
+{
+    var normalizedCode = NormalizeSetupCode(agentSetupCode);
+    if (string.IsNullOrWhiteSpace(normalizedCode))
+    {
+        return null;
+    }
+
+    await using var command = new NpgsqlCommand(
+        """
+        select id, email, token, agent_setup_code, created_at
+        from app_users
+        where upper(agent_setup_code) = @agent_setup_code
+        limit 1
+        """,
+        connection);
+    command.Parameters.AddWithValue("agent_setup_code", normalizedCode);
+
+    await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SingleRow);
+    return await reader.ReadAsync() ? ReadAppUser(reader) : null;
+}
+
+static async Task<string?> FindExistingDeviceRowIdAsync(NpgsqlConnection connection, Guid userId, string normalizedDeviceId)
+{
+    await using var command = new NpgsqlCommand(
+        """
+        select id
+        from devices
+        where user_id = @user_id and device_id = @device_id
+        limit 1
+        """,
+        connection);
+    command.Parameters.AddWithValue("user_id", userId);
+    command.Parameters.AddWithValue("device_id", normalizedDeviceId);
+
+    var result = await command.ExecuteScalarAsync();
+    return result?.ToString();
+}
+
+static AppUserRecord ReadAppUser(NpgsqlDataReader reader)
+{
+    return new AppUserRecord(
+        reader.GetGuid(reader.GetOrdinal("id")),
+        reader["email"]?.ToString() ?? string.Empty,
+        reader["token"]?.ToString() ?? string.Empty,
+        reader["agent_setup_code"]?.ToString() ?? string.Empty,
+        reader.GetFieldValue<DateTimeOffset>(reader.GetOrdinal("created_at")));
+}
+
+static string ReadDateTimeAsIsoString(NpgsqlDataReader reader, string columnName)
+{
+    var ordinal = reader.GetOrdinal(columnName);
+    if (reader.IsDBNull(ordinal))
+    {
+        return string.Empty;
+    }
+
+    var value = reader.GetFieldValue<DateTimeOffset>(ordinal);
+    return value.ToString("O");
+}
+
+static List<DriveInfoRequest> DeserializeDrives(string? drivesJson)
+{
+    if (string.IsNullOrWhiteSpace(drivesJson))
+    {
+        return new List<DriveInfoRequest>();
+    }
+
+    try
+    {
+        return JsonSerializer.Deserialize<List<DriveInfoRequest>>(drivesJson) ?? new List<DriveInfoRequest>();
+    }
+    catch
+    {
+        return new List<DriveInfoRequest>();
     }
 }
 
-static StoredUser EnsureUserHasSetupCode(StoredUser user)
+static List<DriveInfoRequest> NormalizeDrives(List<DriveInfoRequest>? drives)
 {
-    if (!string.IsNullOrWhiteSpace(user.AgentSetupCode))
-    {
-        return user with
-        {
-            AgentSetupCode = NormalizeSetupCode(user.AgentSetupCode),
-        };
-    }
-
-    return user with
-    {
-        AgentSetupCode = GenerateAgentSetupCode(),
-    };
-}
-
-static DeviceRecord BuildDeviceRecord(DeviceSystemInfoRequest request, string? existingId)
-{
-    return new DeviceRecord(
-        existingId ?? Guid.NewGuid().ToString("N"),
-        ValueOrUnknown(request.DeviceName),
-        ValueOrUnknown(request.Processor),
-        ValueOrUnknown(request.ProcessorSpeed),
-        ValueOrUnknown(request.InstalledRam),
-        ValueOrUnknown(request.UsableRam),
-        ValueOrUnknown(request.GraphicsCard),
-        ValueOrUnknown(request.GraphicsMemory),
-        ValueOrUnknown(request.TotalStorage),
-        ValueOrUnknown(request.UsedStorage),
-        ValueOrUnknown(request.FreeStorage),
-        ValueOrUnknown(request.DeviceId),
-        ValueOrUnknown(request.ProductId),
-        ValueOrUnknown(request.SystemType),
-        ValueOrUnknown(request.WindowsEdition),
-        ValueOrUnknown(request.WindowsVersion),
-        ValueOrUnknown(request.OsBuild),
-        ValueOrUnknown(request.InstalledOn),
-        string.IsNullOrWhiteSpace(request.Status) ? "Online" : request.Status.Trim(),
-        DateTimeOffset.UtcNow.ToString("O"),
-        (request.Drives ?? new List<DriveInfoRequest>())
-            .Select(drive => new DriveInfoRequest(
-                ValueOrUnknown(drive.DriveLetter),
-                ValueOrUnknown(drive.DriveType),
-                ValueOrUnknown(drive.FileSystem),
-                ValueOrUnknown(drive.VolumeLabel),
-                ValueOrUnknown(drive.TotalSize),
-                ValueOrUnknown(drive.UsedSpace),
-                ValueOrUnknown(drive.FreeSpace)))
-            .ToList());
+    return (drives ?? new List<DriveInfoRequest>())
+        .Select(drive => new DriveInfoRequest(
+            ValueOrUnknown(drive.DriveLetter),
+            ValueOrUnknown(drive.DriveType),
+            ValueOrUnknown(drive.FileSystem),
+            ValueOrUnknown(drive.VolumeLabel),
+            ValueOrUnknown(drive.TotalSize),
+            ValueOrUnknown(drive.UsedSpace),
+            ValueOrUnknown(drive.FreeSpace)))
+        .ToList();
 }
 
 static string GenerateAgentSetupCode()
@@ -353,40 +533,6 @@ static string NormalizeSetupCode(string? setupCode)
         : setupCode.Trim().ToUpperInvariant();
 }
 
-static void EnsureUsersFileExists(string usersFilePath)
-{
-    if (File.Exists(usersFilePath))
-    {
-        return;
-    }
-
-    File.WriteAllText(usersFilePath, "[]");
-}
-
-static List<StoredUser> LoadUsers(string usersFilePath)
-{
-    try
-    {
-        var json = File.ReadAllText(usersFilePath);
-        var users = JsonSerializer.Deserialize<List<StoredUser>>(json);
-        return users ?? new List<StoredUser>();
-    }
-    catch
-    {
-        return new List<StoredUser>();
-    }
-}
-
-static void SaveUsers(string usersFilePath, List<StoredUser> users)
-{
-    var json = JsonSerializer.Serialize(users, new JsonSerializerOptions
-    {
-        WriteIndented = true,
-    });
-
-    File.WriteAllText(usersFilePath, json);
-}
-
 static string ValueOrUnknown(string? value)
 {
     return string.IsNullOrWhiteSpace(value) ? "Unknown" : value.Trim();
@@ -396,12 +542,12 @@ record RegisterRequest(string? Email, string? Password);
 
 record LoginRequest(string? Email, string? Password);
 
-record StoredUser(
-    string Id,
+record AppUserRecord(
+    Guid Id,
     string Email,
-    string PasswordHash,
-    DateTime CreatedAt,
-    string? AgentSetupCode = null);
+    string Token,
+    string AgentSetupCode,
+    DateTimeOffset CreatedAt);
 
 record DeviceRecord(
     string Id,

@@ -52,7 +52,6 @@ D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\Microsoft.Visual
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\Mono.TextTemplating.dll
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\Newtonsoft.Json.dll
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\Npgsql.dll
-D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\Npgsql.EntityFrameworkCore.PostgreSQL.dll
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\System.CodeDom.dll
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\System.Composition.AttributedModel.dll
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\System.Composition.Convention.dll
@@ -125,3 +124,4 @@ D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\tr\Microsoft.Cod
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\zh-Hans\Microsoft.CodeAnalysis.Workspaces.MSBuild.resources.dll
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\zh-Hant\Microsoft.CodeAnalysis.Workspaces.MSBuild.resources.dll
 D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\users.json
+D:\Project\fix-my-device\services\backend_api\bin\Debug\net10.0\backend_api.staticwebassets.runtime.json

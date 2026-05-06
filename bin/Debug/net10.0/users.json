@@ -1,1 +1,9 @@
-[]
+[
+  {
+    "Id": "061d387f571844c8ad3aac52ed8882fc",
+    "Email": "test01@gmail.com",
+    "PasswordHash": "test@01",
+    "CreatedAt": "2026-05-05T18:32:01.1364622Z",
+    "AgentSetupCode": "FMD-4E97-6378"
+  }
+]

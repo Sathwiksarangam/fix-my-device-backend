@@ -56,10 +56,6 @@ TemporaryDependencyNodeTargetIdentifier=net10.0
 
 [sourceFiles]
 Data/AppDbContext.cs
-Migrations/
- 20260504165820_InitialCreate.cs
- 20260504165820_InitialCreate.Designer.cs
- AppDbContextModelSnapshot.cs
 Models/
  Device.cs
  DeviceDrive.cs
@@ -382,11 +378,9 @@ Program.cs
  WindowsBase.dll
 <NUGET>/
  microsoft.aspnetcore.openapi/10.0.7/lib/net10.0/Microsoft.AspNetCore.OpenApi.dll
- microsoft.entityframeworkcore.abstractions/10.0.7/lib/net10.0/Microsoft.EntityFrameworkCore.Abstractions.dll
- microsoft.entityframeworkcore.relational/10.0.7/lib/net10.0/Microsoft.EntityFrameworkCore.Relational.dll
- microsoft.entityframeworkcore/10.0.7/lib/net10.0/Microsoft.EntityFrameworkCore.dll
+ microsoft.entityframeworkcore.abstractions/10.0.2/lib/net10.0/Microsoft.EntityFrameworkCore.Abstractions.dll
+ microsoft.entityframeworkcore/10.0.2/lib/net10.0/Microsoft.EntityFrameworkCore.dll
  microsoft.openapi/2.4.1/lib/net8.0/Microsoft.OpenApi.dll
- npgsql.entityframeworkcore.postgresql/10.0.1/lib/net10.0/Npgsql.EntityFrameworkCore.PostgreSQL.dll
  npgsql/10.0.2/lib/net10.0/Npgsql.dll
  swashbuckle.aspnetcore.swagger/10.1.7/lib/net10.0/Swashbuckle.AspNetCore.Swagger.dll
  swashbuckle.aspnetcore.swaggergen/10.1.7/lib/net10.0/Swashbuckle.AspNetCore.SwaggerGen.dll
@@ -423,7 +417,7 @@ Program.cs
  microsoft.codeanalysis.analyzers/3.11.0/analyzers/dotnet/cs/
   Microsoft.CodeAnalysis.Analyzers.dll
   Microsoft.CodeAnalysis.CSharp.Analyzers.dll
- microsoft.entityframeworkcore.analyzers/10.0.7/analyzers/dotnet/cs/Microsoft.EntityFrameworkCore.Analyzers.dll
+ microsoft.entityframeworkcore.analyzers/10.0.2/analyzers/dotnet/cs/Microsoft.EntityFrameworkCore.Analyzers.dll
 
 [analyzerConfigFiles]
 <DOTNET>/sdk/10.0.203/Sdks/Microsoft.NET.Sdk/analyzers/build/config/analysislevel_10_default.globalconfig
